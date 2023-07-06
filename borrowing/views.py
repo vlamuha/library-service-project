@@ -4,7 +4,7 @@ import os
 import datetime
 
 from django.http import HttpResponseRedirect
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, reverse
 import stripe
 from django.db.models import QuerySet
 from drf_spectacular.types import OpenApiTypes
@@ -13,6 +13,7 @@ from rest_framework import viewsets, mixins, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django.db import transaction
 from django.urls import reverse
 
@@ -26,6 +27,7 @@ from borrowing.serializers import (
     PaymentListSerializer,
     PaymentDetailSerializer,
 )
+
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -234,57 +236,58 @@ class PaymentViewSet(
         return Response(serializer.errors)
 
 
-@transaction.atomic
-def create_checkout_session(request, borrowing_id):
-    if not request.user:
-        return Response(status=status.HTTP_401_UNAUTHORIZED)
+class CreateCheckoutSessionView(APIView):
+    @transaction.atomic
+    def post(self, request, borrowing_id):
+        if not request.user:
+            return Response(status=status.HTTP_401_UNAUTHORIZED)
 
-    borrowing = Borrowing.objects.get(id=borrowing_id)
+        borrowing = Borrowing.objects.get(id=borrowing_id)
 
-    if Payment.objects.filter(borrowing_id=borrowing_id).exists():
-        payment = Payment.objects.get(borrowing_id=borrowing_id)
-        if payment.status == "PENDING" and borrowing.fine_days:
-            payment.money_to_pay += borrowing.total_fine_amount
+        if Payment.objects.filter(borrowing_id=borrowing_id).exists():
+            payment = Payment.objects.get(borrowing_id=borrowing_id)
+            if payment.status == "PENDING" and borrowing.fine_days:
+                payment.money_to_pay += borrowing.total_fine_amount
 
-        if payment.status == "PAID" and borrowing.fine_days:
-            payment.money_to_pay = borrowing.total_fine_amount
-            payment.type_session = payment.TYPE_CHOICES[1][0]
+            if payment.status == "PAID" and borrowing.fine_days:
+                payment.money_to_pay = borrowing.total_fine_amount
+                payment.type_session = payment.TYPE_CHOICES[1][0]
 
-        if payment.status == "PAID" and not borrowing.fine_days:
-            return Response(status=status.HTTP_303_SEE_OTHER)
-    else:
-        payment = Payment.objects.create(
-            borrowing=borrowing,
-            money_to_pay=borrowing.total_fine_amount,
-            type_session="PAYMENT",
+            if payment.status == "PAID" and not borrowing.fine_days:
+                return Response(status=status.HTTP_303_SEE_OTHER)
+        else:
+            payment = Payment.objects.create(
+                borrowing=borrowing,
+                money_to_pay=borrowing.total_fine_amount,
+                type_session="PAYMENT",
+            )
+
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[
+                {
+                    "price_data": {
+                        "currency": "usd",
+                        "product_data": {
+                            "name": borrowing.book.title,
+                        },
+                        "unit_amount": int(payment.money_to_pay * 100),
+                    },
+                    "quantity": 1,
+                }
+            ],
+            mode="payment",
+            success_url=request.build_absolute_uri(
+                reverse("borrowing:payment-success", args=[payment.id])
+            ),
+            cancel_url=request.build_absolute_uri(
+                reverse("borrowing:cancel-payment", args=[payment.id])
+            ),
+            metadata={"payment_id": payment.id},
         )
 
-    session = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        line_items=[
-            {
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": borrowing.book.title,
-                    },
-                    "unit_amount": int(payment.money_to_pay * 100),
-                },
-                "quantity": 1,
-            }
-        ],
-        mode="payment",
-        success_url=request.build_absolute_uri(
-            reverse("borrowing:payment-success", args=[payment.id])
-        ),
-        cancel_url=request.build_absolute_uri(
-            reverse("borrowing:cancel-payment", args=[payment.id])
-        ),
-        metadata={"payment_id": payment.id},
-    )
+        payment.session_id = session.id
+        payment.session_url = session.url
+        payment.save()
 
-    payment.session_id = session.id
-    payment.session_url = session.url
-    payment.save()
-
-    return HttpResponseRedirect(session.url)
+        return HttpResponseRedirect(session.url)
