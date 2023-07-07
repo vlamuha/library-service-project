@@ -7,7 +7,7 @@ from rest_framework.reverse import reverse
 from borrowings.models import Payment
 
 
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+stripe.api_key = os.getenv("STRIPE_KEY")
 
 
 @transaction.atomic
