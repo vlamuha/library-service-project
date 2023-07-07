@@ -1,0 +1,6 @@
+venv
+**__pycashe__
+.idea
+.env
+.DS_Store
+db.sqlite3
