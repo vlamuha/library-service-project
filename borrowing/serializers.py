@@ -1,29 +1,29 @@
+from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers
 
-from borrowing.models import Borrowing, Payment
+from books.serializers import BookSerializer
+from borrowings.models import Borrowing, Payment
+from borrowings.notification_service import send_telegram_message
+from borrowings.payment_service import create_stripe_session
 
 
-class PaymentListSerializer(serializers.ModelSerializer):
-    money_to_pay = serializers.SerializerMethodField()
-
+class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
         fields = (
+            "id",
             "status",
-            "type_session",
+            "type",
+            "borrowing",
             "session_url",
             "session_id",
             "money_to_pay",
-            "borrowing",
         )
 
-    def get_money_to_pay(self, obj):
-        return obj.money_to_pay
 
-
-class BorrowingListSerializer(serializers.ModelSerializer):
-    book_title = serializers.CharField(source="book.title", read_only=True)
-    book_author = serializers.CharField(source="book.author", read_only=True)
+class BorrowingSerializer(serializers.ModelSerializer):
+    payments = PaymentSerializer(many=True, read_only=True)
 
     class Meta:
         model = Borrowing
@@ -32,72 +32,90 @@ class BorrowingListSerializer(serializers.ModelSerializer):
             "borrow_date",
             "expected_return_date",
             "actual_return_date",
-            "book_title",
-            "book_author",
+            "book",
             "user",
-        )
-
-
-class BorrowingDetailSerializer(serializers.ModelSerializer):
-    book_title = serializers.CharField(source="book.title")
-    book_author = serializers.CharField(source="book.author")
-    book_cover = serializers.CharField(source="book.cover")
-    book_daily_fee = serializers.CharField(source="book.daily_fee")
-    payments = PaymentListSerializer(many=True)
-
-    class Meta:
-        model = Borrowing
-        fields = (
-            "id",
-            "borrow_date",
-            "expected_return_date",
-            "actual_return_date",
-            "book_title",
-            "book_author",
-            "book_cover",
-            "book_daily_fee",
             "payments",
-            "user",
         )
+        read_only_fields = ("id", "borrow_date", "actual_return_date", "user")
 
-        read_only_fields = (
-            "book_title",
-            "book_author",
-            "book_cover",
-            "book_daily_fee",
-            "payments",
-            "user",
-        )
-
-
-class BorrowingCreateSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Borrowing
-        fields = ("id", "book", "expected_return_date", "user")
-        read_only_fields = ("user",)
-
-    def create(self, validated_data):
+    def validate(self, attrs):
         user = self.context["request"].user
-        validated_data["user"] = user
-        return super().create(validated_data)
 
+        if Payment.objects.filter(
+            borrowing__user=user, status=Payment.StatusChoices.PENDING
+        ).exists():
+            raise serializers.ValidationError(
+                "You have pending payments. Cannot borrow a new book."
+            )
 
-class BorrowingReturnSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Borrowing
-        fields = ("id",)
+        return attrs
 
+    def validate_book(self, book):
+        if book.inventory == 0:
+            raise serializers.ValidationError(
+                "Book is not available for borrowing."
+            )
+        return book
 
-class PaymentDetailSerializer(serializers.ModelSerializer):
-    borrowing = BorrowingListSerializer()
+    @transaction.atomic
+    def create(self, validated_data):
+        book = validated_data["book"]
+        user = self.context["request"].user
 
-    class Meta:
-        model = Payment
-        fields = (
-            "status",
-            "type_session",
-            "session_url",
-            "session_id",
-            "money_to_pay",
-            "borrowing",
+        borrowing = Borrowing.objects.create(
+            expected_return_date=validated_data["expected_return_date"],
+            book=book,
+            user=user,
         )
+
+        create_stripe_session(self.context["request"], borrowing)
+
+        book.inventory -= 1
+        book.save()
+
+        message = (
+            f"New borrowing created:\nUser: {user.email}\nBook: {book.title}"
+        )
+        send_telegram_message(message)
+
+        return borrowing
+
+
+class BorrowingListSerializer(BorrowingSerializer):
+    book = BookSerializer(read_only=True)
+    user = serializers.ReadOnlyField(source="user.email")
+
+
+class BorrowingReturnSerializer(BorrowingSerializer):
+    expected_return_date = serializers.ReadOnlyField()
+    book = serializers.ReadOnlyField()
+
+    def validate(self, attrs):
+        borrowing = self.instance
+
+        if borrowing.actual_return_date is not None:
+            raise serializers.ValidationError("Book has already been returned")
+
+        return attrs
+
+    @transaction.atomic
+    def save(self, **kwargs):
+        borrowing = self.instance
+        borrowing.actual_return_date = timezone.now().date()
+        borrowing.save()
+
+        book = borrowing.book
+        book.inventory += 1
+        book.save()
+
+        if borrowing.actual_return_date > borrowing.expected_return_date:
+            fine_amount = borrowing.fine_price
+
+            Payment.objects.create(
+                status=Payment.StatusChoices.PENDING,
+                type=Payment.TypeChoices.FINE,
+                borrowing=borrowing,
+                money_to_pay=fine_amount,
+            )
+
+        return borrowing
