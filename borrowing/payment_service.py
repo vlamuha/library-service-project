@@ -48,4 +48,3 @@ def create_stripe_session(request, borrowing):
     payment.session_url = session.url
     payment.session_id = session.id
     payment.save()
-  
