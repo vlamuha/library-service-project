@@ -1,21 +1,23 @@
-from django.urls import path
-from rest_framework.routers import DefaultRouter
-from borrowing.views import (
-    BorrowingViewSet,
-    PaymentViewSet,
-    CreateCheckoutSessionView
-)
+from django.urls import path, include
+from rest_framework import routers
 
-router = DefaultRouter()
-router.register(r'borrowings', BorrowingViewSet, basename='borrowings')
-router.register(r'payments', PaymentViewSet, basename='payments')
+from borrowings.views import BorrowingViewSet, PaymentViewSet
+
+router = routers.DefaultRouter()
+router.register("borrowings", BorrowingViewSet, basename="borrowing")
+router.register("payments", PaymentViewSet, basename="payment")
 
 urlpatterns = [
     path(
-        'payments/create-checkout-session/<int:borrowing_id>/',
-        CreateCheckoutSessionView,
-        name='create-checkout-session'
+        "payments/<int:pk>/success/",
+        PaymentViewSet.as_view({"get": "payment_success"}),
+        name="payment_success",
+    ),
+    path(
+        "payments/<int:pk>/cancel/",
+        PaymentViewSet.as_view({"get": "payment_cancel"}),
+        name="payment_cancel",
     ),
 ] + router.urls
 
-app_name = 'borrowing'
+app_name = "borrowings"
