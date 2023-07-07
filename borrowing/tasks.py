@@ -1,46 +1,27 @@
-from django.utils import timezone
-import datetime
-import telegram
-from dotenv import load_dotenv
-from celery.schedules import crontab
-import asyncio
-import os
-
-from borrowing.models import Borrowing
-from borrowing.serializers import BorrowingDetailSerializer
-from library_service.celery import app
+from datetime import date, timedelta
 
 
-load_dotenv()
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-bot = telegram.Bot(token=BOT_TOKEN)
+from borrowings.models import Borrowing
+from borrowings.notification_service import send_telegram_message
 
 
-@app.on_after_configure.connect
-def setup_periodic_tasks(sender, **kwargs):
-    sender.add_periodic_task(
-        crontab(hour=19, minute=25),
-        fun=check_and_send_to_telegram.s(),
+def check_overdue_borrowings_task():
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+
+    overdue_borrowings = Borrowing.objects.filter(
+        expected_return_date__lte=tomorrow, actual_return_date=None
     )
 
-
-@app.task
-def check_and_send_to_telegram():
-    tomorrow = timezone.now() + datetime.timedelta(days=1)
-    borrowings = Borrowing.objects.filter(expected_return_date__lte=tomorrow).all()
-
-    async def send_message(text):
-        await bot.send_message(chat_id=CHAT_ID, text=text)
-
-    message_telegram = []
-    if borrowings:
-        for borrowing in borrowings:
-            borrowing_dict = BorrowingDetailSerializer(borrowing).data
-            message_telegram.append(
-                f"User {borrowing_dict['user']} "
-                f"return to - {borrowing_dict['expected_return_date']}."
+    if overdue_borrowings.exists():
+        for borrowing in overdue_borrowings:
+            message = (
+                f"Overdue borrowing:\n"
+                f"Borrowing ID: {borrowing.id}\n"
+                f"User: {borrowing.user.email}\n"
+                f"Book: {borrowing.book.title}"
             )
+            send_telegram_message(message)
     else:
-        message_telegram = "No borrowings overdue today!"
-    asyncio.run(send_message(message_telegram))
+        message = "No borrowings overdue today!"
+        send_telegram_message(message)
